@@ -17,7 +17,7 @@
 //! ## Blocking Example
 //!
 //! ```no_run
-//! use sod::{idle::backoff, MutService, RetryService, Service, ServiceChain};
+//! use sod::{idle::backoff, MaybeProcessService, MutService, RetryService, Service, ServiceChain};
 //! use sod_tungstenite::{UninitializedWsSession, WsServer, WsSession, WsSessionEvent};
 //! use std::{sync::atomic::Ordering, thread::spawn};
 //! use tungstenite::{http::StatusCode, Message};
@@ -25,7 +25,8 @@
 //!
 //! // server session logic to add `"pong: "` in front of text payload
 //! struct PongService;
-//! impl Service<Message> for PongService {
+//! impl Service for PongService {
+//!     type Input = Message;
 //!     type Output = Option<Message>;
 //!     type Error = ();
 //!     fn process(&self, input: Message) -> Result<Self::Output, Self::Error> {
@@ -38,7 +39,8 @@
 //!
 //! // wires session logic and spawns in new thread
 //! struct SessionSpawner;
-//! impl Service<UninitializedWsSession> for SessionSpawner {
+//! impl Service for SessionSpawner {
+//!     type Input = UninitializedWsSession;
 //!     type Output = ();
 //!     type Error = ();
 //!     fn process(&self, input: UninitializedWsSession) -> Result<Self::Output, Self::Error> {
@@ -46,7 +48,7 @@
 //!             let (r, w) = input.handshake().unwrap().into_split();
 //!             let chain = ServiceChain::start(r)
 //!                 .next(PongService)
-//!                 .next(w)
+//!                 .next(MaybeProcessService::new(w))
 //!                 .end();
 //!             sod::thread::spawn_loop(chain, |err| {
 //!                 println!("Session: {err:?}");
@@ -93,7 +95,7 @@
 //! ## Non-Blocking Example
 //!
 //! ```
-//! use sod::{idle::backoff, MutService, RetryService, Service, ServiceChain};
+//! use sod::{idle::backoff, MaybeProcessService, MutService, RetryService, Service, ServiceChain};
 //! use sod_tungstenite::{UninitializedWsSession, WsServer, WsSession, WsSessionEvent};
 //! use std::{sync::atomic::Ordering, thread::spawn};
 //! use tungstenite::{http::StatusCode, Message};
@@ -101,7 +103,8 @@
 //!
 //! // server session logic to add `"pong: "` in front of text payload
 //! struct PongService;
-//! impl Service<Message> for PongService {
+//! impl Service for PongService {
+//!     type Input = Message;
 //!     type Output = Option<Message>;
 //!     type Error = ();
 //!     fn process(&self, input: Message) -> Result<Self::Output, Self::Error> {
@@ -114,7 +117,8 @@
 //!
 //! // wires session logic and spawns in new thread
 //! struct SessionSpawner;
-//! impl Service<UninitializedWsSession> for SessionSpawner {
+//! impl Service for SessionSpawner {
+//!     type Input = UninitializedWsSession;
 //!     type Output = ();
 //!     type Error = ();
 //!     fn process(&self, input: UninitializedWsSession) -> Result<Self::Output, Self::Error> {
@@ -122,7 +126,7 @@
 //!             let (r, w) = input.handshake().unwrap().into_split();
 //!             let chain = ServiceChain::start(RetryService::new(r, backoff))
 //!                 .next(PongService)
-//!                 .next(RetryService::new(w, backoff))
+//!                 .next(MaybeProcessService::new(RetryService::new(w, backoff)))
 //!                 .end();
 //!             sod::thread::spawn_loop(chain, |err| {
 //!                 println!("Session: {err:?}");
@@ -232,14 +236,15 @@ impl WsSession<MaybeTlsStream<TcpStream>> {
         set_nonblocking(self.ws.get_ref(), nonblocking)
     }
 }
-impl<S: Read + Write> MutService<WsSessionEvent> for WsSession<S> {
+impl<S: Read + Write> MutService for WsSession<S> {
+    type Input = WsSessionEvent;
     type Output = Option<Message>;
     type Error = Error;
     fn process(&mut self, input: WsSessionEvent) -> Result<Self::Output, Self::Error> {
         Ok(match input {
-            WsSessionEvent::ReadMessage => Some(self.ws.borrow_mut().read_message()?),
+            WsSessionEvent::ReadMessage => Some(self.ws.borrow_mut().read()?),
             WsSessionEvent::WriteMessage(message) => {
-                self.ws.borrow_mut().write_message(message)?;
+                self.ws.borrow_mut().send(message)?;
                 None
             }
         })
@@ -248,7 +253,7 @@ impl<S: Read + Write> MutService<WsSessionEvent> for WsSession<S> {
 impl<S> Retryable<WsSessionEvent, Error> for WsSession<S> {
     fn parse_retry(&self, err: Error) -> Result<WsSessionEvent, RetryError<Error>> {
         match err {
-            Error::SendQueueFull(message) => Ok(WsSessionEvent::WriteMessage(message)),
+            Error::WriteBufferFull(message) => Ok(WsSessionEvent::WriteMessage(message)),
             Error::Io(io_err) => match &io_err.kind() {
                 ErrorKind::WouldBlock => Ok(WsSessionEvent::ReadMessage),
                 _ => Err(RetryError::ServiceError(Error::Io(io_err))),
@@ -268,7 +273,8 @@ impl<S> WsReader<S> {
         Self { ws }
     }
 }
-impl<S: Read + Write> Service<()> for WsReader<S> {
+impl<S: Read + Write> Service for WsReader<S> {
+    type Input = ();
     type Output = Message;
     type Error = Error;
     fn process(&self, _: ()) -> Result<Self::Output, Self::Error> {
@@ -281,7 +287,7 @@ impl<S: Read + Write> Service<()> for WsReader<S> {
                 )))
             }
         };
-        lock.read_message()
+        lock.read()
     }
 }
 impl<S> Retryable<(), Error> for WsReader<S> {
@@ -306,7 +312,8 @@ impl<S> WsWriter<S> {
         Self { ws }
     }
 }
-impl<S: Read + Write> Service<Message> for WsWriter<S> {
+impl<S: Read + Write> Service for WsWriter<S> {
+    type Input = Message;
     type Output = ();
     type Error = Error;
     fn process(&self, input: Message) -> Result<Self::Output, Self::Error> {
@@ -319,42 +326,21 @@ impl<S: Read + Write> Service<Message> for WsWriter<S> {
                 )))
             }
         };
-        lock.write_message(input)
+        lock.send(input)
     }
 }
 impl<S> Retryable<Message, Error> for WsWriter<S> {
     fn parse_retry(&self, err: Error) -> Result<Message, RetryError<Error>> {
         match err {
-            Error::SendQueueFull(message) => Ok(message),
+            Error::WriteBufferFull(message) => Ok(message),
             err => Err(RetryError::ServiceError(err)),
-        }
-    }
-}
-impl<S: Read + Write> Service<Option<Message>> for WsWriter<S> {
-    type Output = ();
-    type Error = Error;
-    fn process(&self, input: Option<Message>) -> Result<Self::Output, Self::Error> {
-        match input {
-            Some(input) => {
-                let mut lock = match self.ws.lock() {
-                    Ok(lock) => lock,
-                    Err(_) => {
-                        return Err(Error::Io(io::Error::new(
-                            ErrorKind::Other,
-                            "WsWriter mutex poisoned",
-                        )))
-                    }
-                };
-                lock.write_message(input)
-            }
-            None => Ok(()),
         }
     }
 }
 impl<S> Retryable<Option<Message>, Error> for WsWriter<S> {
     fn parse_retry(&self, err: Error) -> Result<Option<Message>, RetryError<Error>> {
         match err {
-            Error::SendQueueFull(message) => Ok(Some(message)),
+            Error::WriteBufferFull(message) => Ok(Some(message)),
             err => Err(RetryError::ServiceError(err)),
         }
     }
@@ -467,7 +453,8 @@ impl WsServer {
         self
     }
 }
-impl Service<()> for WsServer {
+impl Service for WsServer {
+    type Input = ();
     type Output = UninitializedWsSession;
     type Error = io::Error;
     fn process(&self, _: ()) -> Result<Self::Output, Self::Error> {
@@ -513,7 +500,9 @@ fn set_nonblocking(stream: &MaybeTlsStream<TcpStream>, nonblocking: bool) -> Res
 #[cfg(test)]
 mod tests {
     use crate::{UninitializedWsSession, WsServer, WsSession};
-    use sod::{idle::backoff, MutService, RetryService, Service, ServiceChain};
+    use sod::{
+        idle::backoff, MaybeProcessService, MutService, RetryService, Service, ServiceChain,
+    };
     use std::{sync::atomic::Ordering, thread::spawn};
     use tungstenite::{http::StatusCode, Message};
     use url::Url;
@@ -522,7 +511,8 @@ mod tests {
     fn ping_pong() {
         // server session logic to add `"pong: "` in front of text payload
         struct PongService;
-        impl Service<Message> for PongService {
+        impl Service for PongService {
+            type Input = Message;
             type Output = Option<Message>;
             type Error = ();
             fn process(&self, input: Message) -> Result<Self::Output, Self::Error> {
@@ -535,7 +525,8 @@ mod tests {
 
         // wires session logic and spawns in new thread
         struct SessionSpawner;
-        impl Service<UninitializedWsSession> for SessionSpawner {
+        impl Service for SessionSpawner {
+            type Input = UninitializedWsSession;
             type Output = ();
             type Error = ();
             fn process(&self, input: UninitializedWsSession) -> Result<Self::Output, Self::Error> {
@@ -543,7 +534,7 @@ mod tests {
                     let (r, w) = input.handshake().unwrap().into_split();
                     let chain = ServiceChain::start(RetryService::new(r, backoff))
                         .next(PongService)
-                        .next(RetryService::new(w, backoff))
+                        .next(MaybeProcessService::new(RetryService::new(w, backoff)))
                         .end();
                     sod::thread::spawn_loop(chain, |err| {
                         println!("Session: {err:?}");

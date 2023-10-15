@@ -1,6 +1,6 @@
 [package]
 name = "sod-tungstenite"
-version = "0.2.2"
+version = "0.3.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Eric Thill"]
@@ -11,8 +11,8 @@ categories = ["rust-patterns"]
 exclude = ["Cargo.lock"]
 
 [dependencies]
-sod = "0.2.2"
-tungstenite = "0.19.0"
+sod = "0.3.1"
+tungstenite = "0.20.1"
 
 [dev-dependencies]
 url = "2.3.1"

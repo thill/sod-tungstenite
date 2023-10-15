@@ -90,7 +90,7 @@ handle.join().unwrap();
 ## Non-Blocking Example
 
 ```rust
-use sod::{idle::backoff, MutService, RetryService, Service, ServiceChain};
+use sod::{idle::backoff, MaybeProcessService, MutService, RetryService, Service, ServiceChain};
 use sod_tungstenite::{WsServer, WsSession};
 use std::{io::{Read, Write}, sync::atomic::Ordering};
 use tungstenite::{http::StatusCode, Message};
@@ -118,7 +118,7 @@ impl<S: Read + Write + Send + 'static> Service<WsSession<S>> for SessionSpawner 
         let (r, w) = input.into_split();
         let chain = ServiceChain::start(RetryService::new(r, backoff))
             .next(PongService)
-            .next(RetryService::new(w, backoff))
+            .next(MaybeProcessService::new(RetryService::new(w, backoff)))
             .end();
         sod::thread::spawn_loop(chain, |err| {
             println!("Session: {err:?}");
