@@ -197,7 +197,7 @@ use tungstenite::{
     Error, Message, WebSocket,
 };
 
-extern crate tungstenite;
+pub extern crate tungstenite;
 
 /// An input event for [`WsSession`], which can be a read or write.
 #[derive(Clone, Debug)]

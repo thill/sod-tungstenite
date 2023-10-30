@@ -19,15 +19,16 @@ All Services are `Retryable` and are able to be blocking or non-blocking.
 ## Blocking Example
 
 ```rust
-use sod::{MutService, Service, ServiceChain};
-use sod_tungstenite::{WsServer, WsSession};
-use std::io::{Read, Write};
-use tungstenite::Message;
+use sod::{idle::backoff, MaybeProcessService, MutService, RetryService, Service, ServiceChain};
+use sod_tungstenite::{UninitializedWsSession, WsServer, WsSession, WsSessionEvent};
+use std::{sync::atomic::Ordering, thread::spawn};
+use tungstenite::{http::StatusCode, Message};
 use url::Url;
 
 // server session logic to add `"pong: "` in front of text payload
 struct PongService;
-impl Service<Message> for PongService {
+impl Service for PongService {
+    type Input = Message;
     type Output = Option<Message>;
     type Error = ();
     fn process(&self, input: Message) -> Result<Self::Output, Self::Error> {
@@ -40,15 +41,21 @@ impl Service<Message> for PongService {
 
 // wires session logic and spawns in new thread
 struct SessionSpawner;
-impl<S: Read + Write + Send + 'static> Service<WsSession<S>> for SessionSpawner {
+impl Service for SessionSpawner {
+    type Input = UninitializedWsSession;
     type Output = ();
     type Error = ();
-    fn process(&self, input: WsSession<S>) -> Result<Self::Output, Self::Error> {
-        let (r, w) = input.into_split();
-        let chain = ServiceChain::start(r).next(PongService).next(w).end();
-        sod::thread::spawn_loop(chain, |err| {
-            println!("Session: {err:?}");
-            Err(err) // stop thread on error
+    fn process(&self, input: UninitializedWsSession) -> Result<Self::Output, Self::Error> {
+        spawn(|| {
+            let (r, w) = input.handshake().unwrap().into_split();
+            let chain = ServiceChain::start(r)
+                .next(PongService)
+                .next(MaybeProcessService::new(w))
+                .end();
+            sod::thread::spawn_loop(chain, |err| {
+                println!("Session: {err:?}");
+                Err(err) // stop thread on error
+            });
         });
         Ok(())
     }
@@ -72,7 +79,7 @@ let (mut client, _) =
 
 // client writes `"hello world"` payload
 client
-    .process(crate::WsSessionEvent::WriteMessage(Message::Text(
+    .process(WsSessionEvent::WriteMessage(Message::Text(
         "hello world!".to_owned(),
     )))
     .unwrap();
@@ -80,7 +87,7 @@ client
 // client receives `"pong: hello world"` payload
 println!(
     "Received: {:?}",
-    client.process(crate::WsSessionEvent::ReadMessage).unwrap()
+    client.process(WsSessionEvent::ReadMessage).unwrap()
 );
 
 // join until server crashes
@@ -91,14 +98,15 @@ handle.join().unwrap();
 
 ```rust
 use sod::{idle::backoff, MaybeProcessService, MutService, RetryService, Service, ServiceChain};
-use sod_tungstenite::{WsServer, WsSession};
-use std::{io::{Read, Write}, sync::atomic::Ordering};
+use sod_tungstenite::{UninitializedWsSession, WsServer, WsSession, WsSessionEvent};
+use std::{sync::atomic::Ordering, thread::spawn};
 use tungstenite::{http::StatusCode, Message};
 use url::Url;
 
 // server session logic to add `"pong: "` in front of text payload
 struct PongService;
-impl Service<Message> for PongService {
+impl Service for PongService {
+    type Input = Message;
     type Output = Option<Message>;
     type Error = ();
     fn process(&self, input: Message) -> Result<Self::Output, Self::Error> {
@@ -111,18 +119,21 @@ impl Service<Message> for PongService {
 
 // wires session logic and spawns in new thread
 struct SessionSpawner;
-impl<S: Read + Write + Send + 'static> Service<WsSession<S>> for SessionSpawner {
+impl Service for SessionSpawner {
+    type Input = UninitializedWsSession;
     type Output = ();
     type Error = ();
-    fn process(&self, input: WsSession<S>) -> Result<Self::Output, Self::Error> {
-        let (r, w) = input.into_split();
-        let chain = ServiceChain::start(RetryService::new(r, backoff))
-            .next(PongService)
-            .next(MaybeProcessService::new(RetryService::new(w, backoff)))
-            .end();
-        sod::thread::spawn_loop(chain, |err| {
-            println!("Session: {err:?}");
-            Err(err) // stop thread on error
+    fn process(&self, input: UninitializedWsSession) -> Result<Self::Output, Self::Error> {
+        spawn(|| {
+            let (r, w) = input.handshake().unwrap().into_split();
+            let chain = ServiceChain::start(RetryService::new(r, backoff))
+                .next(PongService)
+                .next(MaybeProcessService::new(RetryService::new(w, backoff)))
+                .end();
+            sod::thread::spawn_loop(chain, |err| {
+                println!("Session: {err:?}");
+                Err(err) // stop thread on error
+            });
         });
         Ok(())
     }
@@ -132,7 +143,7 @@ impl<S: Read + Write + Send + 'static> Service<WsSession<S>> for SessionSpawner 
 let server = WsServer::bind("127.0.0.1:48490")
     .unwrap()
     .with_nonblocking_sessions(true)
-    .with_nonblocking(true)
+    .with_nonblocking_server(true)
     .unwrap();
 
 // spawn a thread to start accepting new server sessions
@@ -153,14 +164,14 @@ assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
 
 // client writes `"hello world"` payload
 client
-    .process(crate::WsSessionEvent::WriteMessage(Message::Text(
+    .process(WsSessionEvent::WriteMessage(Message::Text(
         "hello world!".to_owned(),
     )))
     .unwrap();
 
 // client receives `"pong: hello world"` payload
 assert_eq!(
-    client.process(crate::WsSessionEvent::ReadMessage).unwrap(),
+    client.process(WsSessionEvent::ReadMessage).unwrap(),
     Some(Message::Text("pong: hello world!".to_owned()))
 );
 
