@@ -4,9 +4,10 @@
 //!
 //! All Services are [`Retryable`] and are able to be blocking or non-blocking.
 //!
-//! - [`WsSession`] is a [`MutService`] that wraps a [`tungstenite::WebSocket`], accepting [`WsSessionEvent`] to send or receive messages. `WsSession::into_split` can split a `WsSession` into a `WsReader` and `WsWriter`.
+//! - [`WsSession`] is a [`MutService`] that wraps a [`tungstenite::WebSocket`], accepting [`WsSessionEvent`] to send or receive messages. `WsSession::into_split` can split a `WsSession` into a `WsReader`, `WsWriter`, and `WsFlusher`.
 //! - [`WsReader`] is a [`Service`] that wraps a [`Mutex<tungstenite::WebSocket>`], accepting a `()` as input and producing [`tungstenite::Message`] as output.
 //! - [`WsWriter`] is a [`Service`] that wraps a [`Mutex<tungstenite::WebSocket>`], accepting a `tungstenite::Message` as input.
+//! - [`WsFlusher`] is a [`Service`] that wraps a [`Mutex<tungstenite::WebSocket>`], accepting a `()` as input.
 //! - [`WsServer`] is a [`Service`] that that listens on a TCP port, accepting a `()` as input and producing a `WsSession` as output.
 //!
 //! ## Features
@@ -45,10 +46,11 @@
 //!     type Error = ();
 //!     fn process(&self, input: UninitializedWsSession) -> Result<Self::Output, Self::Error> {
 //!         spawn(|| {
-//!             let (r, w) = input.handshake().unwrap().into_split();
+//!             let (r, w, f) = input.handshake().unwrap().into_split();
 //!             let chain = ServiceChain::start(r)
 //!                 .next(PongService)
 //!                 .next(MaybeProcessService::new(w))
+//!                 .next(MaybeProcessService::new(f))
 //!                 .end();
 //!             sod::thread::spawn_loop(chain, |err| {
 //!                 println!("Session: {err:?}");
@@ -123,10 +125,11 @@
 //!     type Error = ();
 //!     fn process(&self, input: UninitializedWsSession) -> Result<Self::Output, Self::Error> {
 //!         spawn(|| {
-//!             let (r, w) = input.handshake().unwrap().into_split();
+//!             let (r, w, f) = input.handshake().unwrap().into_split();
 //!             let chain = ServiceChain::start(RetryService::new(r, backoff))
 //!                 .next(PongService)
 //!                 .next(MaybeProcessService::new(RetryService::new(w, backoff)))
+//!                 .next(MaybeProcessService::new(f))
 //!                 .end();
 //!             sod::thread::spawn_loop(chain, |err| {
 //!                 println!("Session: {err:?}");
@@ -204,6 +207,7 @@ pub extern crate tungstenite;
 pub enum WsSessionEvent {
     ReadMessage,
     WriteMessage(Message),
+    Flush,
 }
 
 /// A [`MutService`] that wraps a [`tungstenite::WebSocket`], processing a [`WsSessionEvent`], producing a `Some(Message)` when a [`Message`] is read, and producing `None` otherwise.
@@ -216,9 +220,13 @@ impl<S> WsSession<S> {
         Self { ws }
     }
     /// Split this `WsSession` into a [`WsReader`] and [`WsWriter`], utilizing a [`Mutex`] to coordinate mutability on the underlying stream.
-    pub fn into_split(self) -> (WsReader<S>, WsWriter<S>) {
+    pub fn into_split(self) -> (WsReader<S>, WsWriter<S>, WsFlusher<S>) {
         let ws = Arc::new(Mutex::new(self.ws));
-        (WsReader::new(Arc::clone(&ws)), WsWriter::new(ws))
+        (
+            WsReader::new(Arc::clone(&ws)),
+            WsWriter::new(Arc::clone(&ws)),
+            WsFlusher::new(ws),
+        )
     }
 }
 impl WsSession<MaybeTlsStream<TcpStream>> {
@@ -245,6 +253,10 @@ impl<S: Read + Write> MutService for WsSession<S> {
             WsSessionEvent::ReadMessage => Some(self.ws.borrow_mut().read()?),
             WsSessionEvent::WriteMessage(message) => {
                 self.ws.borrow_mut().send(message)?;
+                None
+            }
+            WsSessionEvent::Flush => {
+                self.ws.borrow_mut().flush()?;
                 None
             }
         })
@@ -302,7 +314,7 @@ impl<S> Retryable<(), Error> for WsReader<S> {
     }
 }
 
-/// The write side of a split [`WsSession`].
+/// The write-side of a split [`WsSession`].
 #[derive(Clone)]
 pub struct WsWriter<S> {
     ws: Arc<Mutex<WebSocket<S>>>,
@@ -326,7 +338,7 @@ impl<S: Read + Write> Service for WsWriter<S> {
                 )))
             }
         };
-        lock.send(input)
+        lock.write(input)
     }
 }
 impl<S> Retryable<Message, Error> for WsWriter<S> {
@@ -343,6 +355,34 @@ impl<S> Retryable<Option<Message>, Error> for WsWriter<S> {
             Error::WriteBufferFull(message) => Ok(Some(message)),
             err => Err(RetryError::ServiceError(err)),
         }
+    }
+}
+
+/// The flush-side of a split [`WsSession`].
+#[derive(Clone)]
+pub struct WsFlusher<S> {
+    ws: Arc<Mutex<WebSocket<S>>>,
+}
+impl<S> WsFlusher<S> {
+    fn new(ws: Arc<Mutex<WebSocket<S>>>) -> Self {
+        Self { ws }
+    }
+}
+impl<S: Read + Write> Service for WsFlusher<S> {
+    type Input = ();
+    type Output = ();
+    type Error = Error;
+    fn process(&self, (): ()) -> Result<Self::Output, Self::Error> {
+        let mut lock = match self.ws.lock() {
+            Ok(lock) => lock,
+            Err(_) => {
+                return Err(Error::Io(io::Error::new(
+                    ErrorKind::Other,
+                    "WsFlusher mutex poisoned",
+                )))
+            }
+        };
+        lock.flush()
     }
 }
 
@@ -531,10 +571,11 @@ mod tests {
             type Error = ();
             fn process(&self, input: UninitializedWsSession) -> Result<Self::Output, Self::Error> {
                 spawn(|| {
-                    let (r, w) = input.handshake().unwrap().into_split();
+                    let (r, w, f) = input.handshake().unwrap().into_split();
                     let chain = ServiceChain::start(RetryService::new(r, backoff))
                         .next(PongService)
                         .next(MaybeProcessService::new(RetryService::new(w, backoff)))
+                        .next(MaybeProcessService::new(f))
                         .end();
                     sod::thread::spawn_loop(chain, |err| {
                         println!("Session: {err:?}");

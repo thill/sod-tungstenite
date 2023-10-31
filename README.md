@@ -6,9 +6,10 @@
 
 All Services are `Retryable` and are able to be blocking or non-blocking.
 
-- `WsSession` is a `MutService` that wraps a `tungstenite::WebSocket`, accepting `WsSessionEvent` to send or receive messages. `WsSession::into_split` can split a `WsSession` into a `WsReader` and `WsWriter`.
+- `WsSession` is a `MutService` that wraps a `tungstenite::WebSocket`, accepting `WsSessionEvent` to send or receive messages. `WsSession::into_split` can split a `WsSession` into a `WsReader`, `WsWriter`, and `WsFlusher`.
 - `WsReader` is a `Service` that wraps a `Mutex<tungstenite::WebSocket>`, accepting a `()` as input and producing `tungstenite::Message` as output.
 - `WsWriter` is a `Service` that wraps a `Mutex<tungstenite::WebSocket>`, accepting a `tungstenite::Message` as input.
+- `WsFlusher` is a `Service` that wraps a `Mutex<tungstenite::WebSocket>`, accepting a `()` as input.
 - `WsServer` is a `Service` that that listens on a TCP port, accepting a `()` as input and producing a `WsSession` as output.
 
 ## Features
@@ -47,10 +48,11 @@ impl Service for SessionSpawner {
     type Error = ();
     fn process(&self, input: UninitializedWsSession) -> Result<Self::Output, Self::Error> {
         spawn(|| {
-            let (r, w) = input.handshake().unwrap().into_split();
+            let (r, w, f) = input.handshake().unwrap().into_split();
             let chain = ServiceChain::start(r)
                 .next(PongService)
                 .next(MaybeProcessService::new(w))
+                .next(MaybeProcessService::new(f))
                 .end();
             sod::thread::spawn_loop(chain, |err| {
                 println!("Session: {err:?}");
@@ -125,10 +127,11 @@ impl Service for SessionSpawner {
     type Error = ();
     fn process(&self, input: UninitializedWsSession) -> Result<Self::Output, Self::Error> {
         spawn(|| {
-            let (r, w) = input.handshake().unwrap().into_split();
+            let (r, w, f) = input.handshake().unwrap().into_split();
             let chain = ServiceChain::start(RetryService::new(r, backoff))
                 .next(PongService)
                 .next(MaybeProcessService::new(RetryService::new(w, backoff)))
+                .next(MaybeProcessService::new(f))
                 .end();
             sod::thread::spawn_loop(chain, |err| {
                 println!("Session: {err:?}");
